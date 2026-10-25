@@ -87,12 +87,25 @@ blueprint:
     min_valve_position:
       name: Minimum valve position (%)
       description: >
-        Valve position where flow starts. Also acts as minimum demand threshold.
-        Below this demand, valve closes completely.
+        Valve position the valve jumps to as soon as demand reaches the demand
+        threshold.
       default: 7
       selector:
         number:
           min: 0
+          max: 20
+          step: 1
+          mode: slider
+
+    demand_threshold:
+      name: Demand threshold (%)
+      description: >
+        Minimum demand that opens the valve. Below it the valve closes
+        completely; at it the valve opens to the minimum valve position.
+      default: 1
+      selector:
+        number:
+          min: 1
           max: 20
           step: 1
           mode: slider
@@ -128,7 +141,7 @@ blueprint:
       default: 100
       selector:
         number:
-          min: 50
+          min: 15
           max: 100
           step: 1
           mode: slider
@@ -210,6 +223,7 @@ action:
       - variables:
           demand: "{{ states(proxy_open) | float(0) }}"
           min_valve: !input min_valve_position
+          demand_thr: !input demand_threshold
           knee_demand: !input knee_demand
           knee_valve: !input knee_valve
           max_valve: !input max_valve_position
@@ -220,10 +234,11 @@ action:
             {% set knee_d = knee_demand | float %}
             {% set knee_v = knee_valve | float %}
             {% set max_v = max_valve | float %}
-            {% if d < min_v %}
+            {% set thr = demand_thr | float %}
+            {% if d < thr %}
               0
             {% elif d < knee_d %}
-              {{ (min_v + (d / knee_d) * (knee_v - min_v)) | round(0) | int }}
+              {{ (min_v + ((d - thr) / (knee_d - thr)) * (knee_v - min_v)) | round(0) | int }}
             {% else %}
               {{ (knee_v + ((d - knee_d) / (100 - knee_d)) * (max_v - knee_v)) | round(0) | int }}
             {% endif %}
