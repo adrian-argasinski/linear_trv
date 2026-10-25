@@ -1,0 +1,241 @@
+blueprint:
+  name: TRV - Linearised response with slam closing
+  description: >
+    Intercepts VTherm proxy valve commands (opening/closing degrees) and forwards
+    them to the physical TRV with two-slope linearization.
+
+    Linearization compensates for non-linear valve response using a two-slope
+    model with configurable parameters (min_valve, knee points, max_valve).
+
+    Normal operation applies linearization after a settle period: the latest
+    proxy values are read, linearized, and written to the TRV.
+
+    Slam close is edge-triggered on the OPENING proxy only:
+    when opening crosses from >= threshold to < threshold, run a single
+    full-open then full-close cycle to reseat the valve.
+
+    The initial settle delay ensures both proxy helpers (opening and closing)
+    have been updated before values are read and forwarded.
+  domain: automation
+
+  input:
+    proxy_opening_degree:
+      name: Proxy opening degree (input_number)
+      description: Opening degree proxy helper from VTherm (0–100).
+      selector:
+        entity:
+          domain: input_number
+
+    proxy_closing_degree:
+      name: Proxy closing degree (input_number)
+      description: Closing degree proxy helper from VTherm (0–100).
+      selector:
+        entity:
+          domain: input_number
+
+    trv_opening_degree:
+      name: TRV opening degree (number)
+      description: Hardware TRV opening degree control (0–100).
+      selector:
+        entity:
+          domain: number
+
+    trv_closing_degree:
+      name: TRV closing degree (number)
+      description: Hardware TRV closing degree control (0–100).
+      selector:
+        entity:
+          domain: number
+
+    slam_threshold:
+      name: Slam threshold
+      description: >
+        Slam triggers only when opening crosses from >= this value to below it.
+        Whole numbers only.
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 1
+          mode: slider
+
+    slam_delay_seconds:
+      name: Slam delay (seconds)
+      description: Delay between the forced full-open and full-close phases.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 1
+          mode: slider
+
+    initial_settle_delay_seconds:
+      name: Initial settle delay (seconds)
+      description: >
+        Coalescing delay to allow both proxy helpers (opening and closing) to
+        update before acting.
+      default: 2
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.5
+          mode: slider
+
+    min_valve_position:
+      name: Minimum valve position (%)
+      description: >
+        Valve position where flow starts. Also acts as minimum demand threshold.
+        Below this demand, valve closes completely.
+      default: 7
+      selector:
+        number:
+          min: 0
+          max: 20
+          step: 1
+          mode: slider
+
+    knee_demand:
+      name: Knee demand point (%)
+      description: >
+        Demand level where saturation begins and the second slope starts.
+      default: 80
+      selector:
+        number:
+          min: 50
+          max: 95
+          step: 1
+          mode: slider
+
+    knee_valve:
+      name: Knee valve position (%)
+      description: >
+        Valve position at the knee point where the slope changes.
+      default: 15
+      selector:
+        number:
+          min: 10
+          max: 50
+          step: 1
+          mode: slider
+
+    max_valve_position:
+      name: Maximum valve position (%)
+      description: >
+        Maximum valve opening position.
+      default: 100
+      selector:
+        number:
+          min: 50
+          max: 100
+          step: 1
+          mode: slider
+
+mode: restart
+
+variables:
+  proxy_open: !input proxy_opening_degree
+  proxy_close: !input proxy_closing_degree
+
+trigger:
+  # Trigger only from the opening proxy to reduce bouncing/restarts
+  - platform: state
+    entity_id: !input proxy_opening_degree
+
+action:
+  # Allow both proxy helpers to settle before acting
+  - delay:
+      seconds: !input initial_settle_delay_seconds
+
+  # Guard against unknown/unavailable values
+  - condition: template
+    value_template: >
+      {% set o = states(proxy_open) %}
+      {% set c = states(proxy_close) %}
+      {{ o not in ['unknown','unavailable','none','']
+         and c not in ['unknown','unavailable','none',''] }}
+
+  # Edge detection on opening proxy for slam close trigger
+  - variables:
+      thr: !input slam_threshold
+      prev_s: "{{ trigger.from_state.state if trigger.from_state else '' }}"
+      curr_s: "{{ trigger.to_state.state if trigger.to_state else '' }}"
+      slam_edge: >
+        {% set thr_f = thr | float(1) %}
+        {% if prev_s not in ['unknown','unavailable','none',''] and curr_s not in ['unknown','unavailable','none',''] %}
+          {% set prev = prev_s | float %}
+          {% set curr = curr_s | float %}
+          {{ prev >= thr_f and curr < thr_f }}
+        {% else %}
+          false
+        {% endif %}
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ slam_edge }}"
+        sequence:
+          # Slam cycle: full open then full close
+          - service: number.set_value
+            target:
+              entity_id: !input trv_opening_degree
+            data:
+              value: 100
+
+          - service: number.set_value
+            target:
+              entity_id: !input trv_closing_degree
+            data:
+              value: 0
+
+          - delay:
+              seconds: !input slam_delay_seconds
+
+          - service: number.set_value
+            target:
+              entity_id: !input trv_closing_degree
+            data:
+              value: 100
+
+          - service: number.set_value
+            target:
+              entity_id: !input trv_opening_degree
+            data:
+              value: 0
+
+    default:
+      # Normal pass-through with two-slope linearization
+      - variables:
+          demand: "{{ states(proxy_open) | float(0) }}"
+          min_valve: !input min_valve_position
+          knee_demand: !input knee_demand
+          knee_valve: !input knee_valve
+          max_valve: !input max_valve_position
+          # Two-slope linearization function
+          linearized_position: >-
+            {% set d = demand %}
+            {% set min_v = min_valve | float %}
+            {% set knee_d = knee_demand | float %}
+            {% set knee_v = knee_valve | float %}
+            {% set max_v = max_valve | float %}
+            {% if d < min_v %}
+              0
+            {% elif d < knee_d %}
+              {{ (min_v + (d / knee_d) * (knee_v - min_v)) | round(0) | int }}
+            {% else %}
+              {{ (knee_v + ((d - knee_d) / (100 - knee_d)) * (max_v - knee_v)) | round(0) | int }}
+            {% endif %}
+
+      - service: number.set_value
+        target:
+          entity_id: !input trv_opening_degree
+        data:
+          value: "{{ linearized_position }}"
+
+      - service: number.set_value
+        target:
+          entity_id: !input trv_closing_degree
+        data:
+          value: "{{ 100 - linearized_position }}"
